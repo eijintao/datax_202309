@@ -4,7 +4,7 @@ import com.alibaba.datax.common.exception.DataXException;
 import com.alibaba.datax.common.plugin.RecordReceiver;
 import com.alibaba.datax.common.spi.Writer;
 import com.alibaba.datax.common.util.Configuration;
-import com.alibaba.datax.plugin.unstructuredstorage.writer.Constant;
+
 import com.google.common.collect.Sets;
 import org.apache.commons.io.Charsets;
 import org.apache.commons.io.IOUtils;
@@ -16,7 +16,8 @@ import org.slf4j.LoggerFactory;
 import parquet.schema.MessageTypeParser;
 
 import java.util.*;
-
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class HdfsWriter extends Writer {
     public static class Job extends Writer.Job {
@@ -53,8 +54,8 @@ public class HdfsWriter extends Writer {
             this.defaultFS = this.writerSliceConfig.getNecessaryValue(Key.DEFAULT_FS, HdfsWriterErrorCode.REQUIRED_VALUE);
             //fileType check
             this.fileType = this.writerSliceConfig.getNecessaryValue(Key.FILE_TYPE, HdfsWriterErrorCode.REQUIRED_VALUE);
-            if( !fileType.equalsIgnoreCase("ORC") && !fileType.equalsIgnoreCase("TEXT")){
-                String message = "HdfsWriter插件目前只支持ORC和TEXT两种格式的文件,请将filetype选项的值配置为ORC或者TEXT";
+            if( !fileType.equalsIgnoreCase("ORC") && !fileType.equalsIgnoreCase("TEXT") && !fileType.equalsIgnoreCase("PARQUET")){
+                String message = "HdfsWriter插件目前只支持ORC和TEXT和PARQUET三种格式的文件,请将filetype选项的值配置为ORC或者TEXT或者PARQUET";
                 throw DataXException.asDataXException(HdfsWriterErrorCode.ILLEGAL_VALUE, message);
             }
             //path
@@ -75,9 +76,22 @@ public class HdfsWriter extends Writer {
             if (null == columns || columns.size() == 0) {
                 throw DataXException.asDataXException(HdfsWriterErrorCode.REQUIRED_VALUE, "您需要指定 columns");
             }else{
-                for (Configuration eachColumnConf : columns) {
+                boolean rewriteFlag = false;
+                for (int i = 0; i < columns.size(); i++) {
+                    Configuration eachColumnConf = columns.get(i);
                     eachColumnConf.getNecessaryValue(Key.NAME, HdfsWriterErrorCode.COLUMN_REQUIRED_VALUE);
                     eachColumnConf.getNecessaryValue(Key.TYPE, HdfsWriterErrorCode.COLUMN_REQUIRED_VALUE);
+                    if (eachColumnConf.getString(Key.TYPE).toUpperCase().startsWith("DECIMAL")) {
+                        String type = eachColumnConf.getString(Key.TYPE);
+                        eachColumnConf.set(Key.TYPE, "decimal");
+                        eachColumnConf.set(Key.PRECISION, getDecimalPrecision(type));
+                        eachColumnConf.set(Key.SCALE, getDecimalScale(type));
+                        columns.set(i, eachColumnConf);
+                        rewriteFlag = true;
+                    }
+                }
+                if (rewriteFlag) {
+                    this.writerSliceConfig.set(Key.COLUMN, columns);
                 }
             }
             //writeMode check
@@ -128,6 +142,19 @@ public class HdfsWriter extends Writer {
                     }
                 }
 
+            }else if(fileType.equalsIgnoreCase("PARQUET")){
+                Set<String> parquetSupportedCompress = Sets.newHashSet("NONE", "SNAPPY");
+                if(null == compress){
+                    this.writerSliceConfig.set(Key.COMPRESS, "NONE");
+                }else {
+                    compress = compress.toUpperCase().trim();
+                    if(!parquetSupportedCompress.contains(compress)){
+                        throw DataXException.asDataXException(HdfsWriterErrorCode.ILLEGAL_VALUE,
+                                String.format("目前SNAPPY FILE仅支持SNAPPY压缩, 不支持您配置的 compress 模式 : [%s]",
+                                        compress));
+                    }
+                }
+
             }
             //Kerberos check
             Boolean haveKerberos = this.writerSliceConfig.getBool(Key.HAVE_KERBEROS, false);
@@ -144,6 +171,58 @@ public class HdfsWriter extends Writer {
             } catch (Exception e) {
                 throw DataXException.asDataXException(HdfsWriterErrorCode.ILLEGAL_VALUE,
                         String.format("不支持您配置的编码格式:[%s]", encoding), e);
+            }
+        }
+
+        /**
+         * get decimal type precision
+         * if not specified, use DECIMAL_DEFAULT_PRECISION as default
+         * example:
+         * <pre>
+         *  decimal -&gt; 38
+         *  decimal(10) -&gt; 10
+         *  </pre>
+         *
+         * @param type decimal type including precision and scale (if present)
+         * @return decimal precision
+         */
+        private static int getDecimalPrecision(String type)
+        {
+            if (!type.contains("(")) {
+                return Constant.DEFAULT_DECIMAL_MAX_PRECISION;
+            }
+            else {
+                String regEx = "[^0-9]";
+                Pattern p = Pattern.compile(regEx);
+                Matcher m = p.matcher(type);
+                return Integer.parseInt(m.replaceAll(" ").trim().split(" ")[0]);
+            }
+        }
+
+        /**
+         * get decimal type scale
+         * if precision is not present, return DECIMAL_DEFAULT_SCALE
+         * if precision is present and not specify scale, return 0
+         * example:
+         * <pre>
+         *  decimal -&gt; 10
+         *  decimal(8) -&gt; 0
+         *  decimal(8,2) -&gt; 2
+         *  </pre>
+         *
+         * @param type decimal type string, including precision and scale (if present)
+         * @return decimal scale
+         */
+        private static int getDecimalScale(String type)
+        {
+            if (!type.contains("(")) {
+                return Constant.DEFAULT_DECIMAL_MAX_SCALE;
+            }
+            if (!type.contains(",")) {
+                return 0;
+            }
+            else {
+                return Integer.parseInt(type.split(",")[1].replace(")", "").trim());
             }
         }
 
@@ -266,10 +345,10 @@ public class HdfsWriter extends Writer {
 
         private String buildFilePath() {
             boolean isEndWithSeparator = false;
-            switch (IOUtils.DIR_SEPARATOR) {
+            switch (IOUtils.DIR_SEPARATOR_UNIX) {
                 case IOUtils.DIR_SEPARATOR_UNIX:
                     isEndWithSeparator = this.path.endsWith(String
-                            .valueOf(IOUtils.DIR_SEPARATOR));
+                            .valueOf(IOUtils.DIR_SEPARATOR_UNIX));
                     break;
                 case IOUtils.DIR_SEPARATOR_WINDOWS:
                     isEndWithSeparator = this.path.endsWith(String
@@ -279,7 +358,7 @@ public class HdfsWriter extends Writer {
                     break;
             }
             if (!isEndWithSeparator) {
-                this.path = this.path + IOUtils.DIR_SEPARATOR;
+                this.path = this.path + IOUtils.DIR_SEPARATOR_UNIX;
             }
             return this.path;
         }
@@ -292,10 +371,10 @@ public class HdfsWriter extends Writer {
         private String buildTmpFilePath(String userPath) {
             String tmpFilePath;
             boolean isEndWithSeparator = false;
-            switch (IOUtils.DIR_SEPARATOR) {
+            switch (IOUtils.DIR_SEPARATOR_UNIX) {
                 case IOUtils.DIR_SEPARATOR_UNIX:
                     isEndWithSeparator = userPath.endsWith(String
-                            .valueOf(IOUtils.DIR_SEPARATOR));
+                            .valueOf(IOUtils.DIR_SEPARATOR_UNIX));
                     break;
                 case IOUtils.DIR_SEPARATOR_WINDOWS:
                     isEndWithSeparator = userPath.endsWith(String
@@ -307,20 +386,20 @@ public class HdfsWriter extends Writer {
             String tmpSuffix;
             tmpSuffix = UUID.randomUUID().toString().replace('-', '_');
             if (!isEndWithSeparator) {
-                tmpFilePath = String.format("%s__%s%s", userPath, tmpSuffix, IOUtils.DIR_SEPARATOR);
+                tmpFilePath = String.format("%s__%s%s", userPath, tmpSuffix, IOUtils.DIR_SEPARATOR_UNIX);
             }else if("/".equals(userPath)){
-                tmpFilePath = String.format("%s__%s%s", userPath, tmpSuffix, IOUtils.DIR_SEPARATOR);
+                tmpFilePath = String.format("%s__%s%s", userPath, tmpSuffix, IOUtils.DIR_SEPARATOR_UNIX);
             }else{
-                tmpFilePath = String.format("%s__%s%s", userPath.substring(0,userPath.length()-1), tmpSuffix, IOUtils.DIR_SEPARATOR);
+                tmpFilePath = String.format("%s__%s%s", userPath.substring(0,userPath.length()-1), tmpSuffix, IOUtils.DIR_SEPARATOR_UNIX);
             }
             while(hdfsHelper.isPathexists(tmpFilePath)){
                 tmpSuffix = UUID.randomUUID().toString().replace('-', '_');
                 if (!isEndWithSeparator) {
-                    tmpFilePath = String.format("%s__%s%s", userPath, tmpSuffix, IOUtils.DIR_SEPARATOR);
+                    tmpFilePath = String.format("%s__%s%s", userPath, tmpSuffix, IOUtils.DIR_SEPARATOR_UNIX);
                 }else if("/".equals(userPath)){
-                    tmpFilePath = String.format("%s__%s%s", userPath, tmpSuffix, IOUtils.DIR_SEPARATOR);
+                    tmpFilePath = String.format("%s__%s%s", userPath, tmpSuffix, IOUtils.DIR_SEPARATOR_UNIX);
                 }else{
-                    tmpFilePath = String.format("%s__%s%s", userPath.substring(0,userPath.length()-1), tmpSuffix, IOUtils.DIR_SEPARATOR);
+                    tmpFilePath = String.format("%s__%s%s", userPath.substring(0,userPath.length()-1), tmpSuffix, IOUtils.DIR_SEPARATOR_UNIX);
                 }
             }
             return tmpFilePath;
@@ -415,11 +494,11 @@ public class HdfsWriter extends Writer {
                 //写ORC FILE
                 hdfsHelper.orcFileStartWrite(lineReceiver,this.writerSliceConfig, this.fileName,
                         this.getTaskPluginCollector());
-            } else if (fileType.equalsIgnoreCase("PARQUET")) {
+            }else if(fileType.equalsIgnoreCase("PARQUET")){
                 //写PARQUET FILE
-                hdfsHelper.parquetFileStartWrite(lineReceiver, this.writerSliceConfig, this.fileName, this.getTaskPluginCollector(), this.writerSliceConfig);
+                hdfsHelper.parquetFileStartWrite(lineReceiver,this.writerSliceConfig, this.fileName,
+                        this.getTaskPluginCollector());
             }
-
             LOG.info("end do write");
         }
 

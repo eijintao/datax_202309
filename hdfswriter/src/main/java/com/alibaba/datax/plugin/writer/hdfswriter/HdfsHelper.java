@@ -10,29 +10,51 @@ import com.alibaba.datax.plugin.unstructuredstorage.util.ColumnTypeUtil;
 import com.alibaba.datax.plugin.unstructuredstorage.util.HdfsUtil;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
+import org.apache.avro.JsonProperties;
+import org.apache.hadoop.hive.serde2.io.TimestampWritable;
+import org.codehaus.jackson.node.JsonNodeFactory;
 import com.google.common.collect.Lists;
+import org.apache.avro.Conversions;
+import org.apache.avro.LogicalTypes;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.generic.GenericRecordBuilder;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Validate;
 import org.apache.commons.lang3.tuple.MutablePair;
 import org.apache.hadoop.fs.*;
 import org.apache.hadoop.hive.common.type.HiveDecimal;
+import org.apache.hadoop.hive.metastore.api.Decimal;
 import org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat;
 import org.apache.hadoop.hive.ql.io.orc.OrcSerde;
+import org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat;
+import org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspectorFactory;
 import org.apache.hadoop.hive.serde2.objectinspector.StructObjectInspector;
 import org.apache.hadoop.io.NullWritable;
+import org.apache.hadoop.io.ObjectWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.hadoop.mapred.*;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.parquet.avro.AvroParquetWriter;
+import org.apache.parquet.column.ParquetProperties;
+import org.apache.parquet.hadoop.ParquetWriter;
+import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import parquet.hadoop.metadata.CompressionCodecName;
-import parquet.schema.*;
+
+import parquet.schema.OriginalType;
+import parquet.schema.PrimitiveType;
+import parquet.schema.Types;
+
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.net.URI;
+import java.sql.Timestamp;
 import java.text.SimpleDateFormat;
 import java.util.*;
 
@@ -61,6 +83,7 @@ public  class HdfsHelper {
             }
         }
         hadoopConf.set(HDFS_DEFAULTFS_KEY, defaultFS);
+        String hdfsUser = taskConfig.getString("hdfsUser");
 
         //是否有Kerberos认证
         this.haveKerberos = taskConfig.getBool(Key.HAVE_KERBEROS, false);
@@ -72,7 +95,13 @@ public  class HdfsHelper {
         this.kerberosAuthentication(this.kerberosPrincipal, this.kerberosKeytabFilePath);
         conf = new JobConf(hadoopConf);
         try {
-            fileSystem = FileSystem.get(conf);
+            if (StringUtils.isNotBlank(hdfsUser) && !haveKerberos) {
+                System.setProperty("HADOOP_USER_NAME",hdfsUser);
+                fileSystem = FileSystem.get(new URI(hadoopConf.get(HDFS_DEFAULTFS_KEY)), conf, hdfsUser);
+                //this.fileSystem = FileSystem.get(conf);
+            } else {
+                fileSystem = FileSystem.get(conf);
+            }
         } catch (IOException e) {
             String message = String.format("获取FileSystem时发生网络IO异常,请检查您的网络是否正常!HDFS地址：[%s]",
                     "message:defaultFS =" + defaultFS);
@@ -223,6 +252,7 @@ public  class HdfsHelper {
                 for (Iterator it1=tmpFiles.iterator(),it2=endFiles.iterator();it1.hasNext()&&it2.hasNext();){
                     String srcFile = it1.next().toString();
                     String dstFile = it2.next().toString();
+                    dstFile = dstFile.replace("\\","/");
                     Path srcFilePah = new Path(srcFile);
                     Path dstFilePah = new Path(dstFile);
                     if(tmpFilesParent == null){
@@ -455,6 +485,12 @@ public  class HdfsHelper {
                 case BOOLEAN:
                     objectInspector = ObjectInspectorFactory.getReflectionObjectInspector(Boolean.class, ObjectInspectorFactory.ObjectInspectorOptions.JAVA);
                     break;
+                //case DECIMAL:
+                //    objectInspector = ObjectInspectorFactory.getReflectionObjectInspector(BigDecimal.class, ObjectInspectorFactory.ObjectInspectorOptions.JAVA);
+                //    break;
+                case DECIMAL:
+                    objectInspector = ObjectInspectorFactory.getReflectionObjectInspector(HiveDecimal.class, ObjectInspectorFactory.ObjectInspectorOptions.JAVA);
+                    break;
                 default:
                     throw DataXException
                             .asDataXException(
@@ -537,7 +573,9 @@ public  class HdfsHelper {
                             case TIMESTAMP:
                                 recordList.add(new java.sql.Timestamp(column.asDate().getTime()));
                                 break;
-                            //    这里有更改
+                            //case DECIMAL:
+                            //    recordList.add(BigDecimal.valueOf(column.asDouble().doubleValue()));
+                            //    break;
                             case DECIMAL:
                                 recordList.add(HiveDecimal.create(new BigDecimal(rowData)));
                                 break;
@@ -632,60 +670,267 @@ public  class HdfsHelper {
         return typeBuilder.named("m").toString();
     }
 
-    public void parquetFileStartWrite(RecordReceiver lineReceiver, Configuration config, String fileName, TaskPluginCollector taskPluginCollector, Configuration taskConfig) {
-        MessageType messageType = null;
-        ParquetFileProccessor proccessor = null;
-        Path outputPath = new Path(fileName);
-        String schema = config.getString(Key.PARQUET_SCHEMA);
-        try {
-            messageType = MessageTypeParser.parseMessageType(schema);
-        } catch (Exception e) {
-            String message = String.format("Error parsing the Schema string [%s] into MessageType", schema);
-            LOG.error(message);
-            throw DataXException.asDataXException(HdfsWriterErrorCode.PARSE_MESSAGE_TYPE_FROM_SCHEMA_ERROR, e);
-        }
 
-        // determine the compression codec
-        String compress = config.getString(Key.COMPRESS, null);
-        // be compatible with the old NONE
-        if ("NONE".equalsIgnoreCase(compress)) {
+
+    /**
+     * 写parquet文件
+     * @param lineReceiver
+     * @param config
+     * @param fileName
+     * @param taskPluginCollector
+     */
+    public void parquetFileStartWrite(RecordReceiver lineReceiver, Configuration config, String fileName, TaskPluginCollector taskPluginCollector) {
+        List<Configuration> columns = config.getListConfiguration(Key.COLUMN);
+        String compress = config.getString(Key.COMPRESS, "UNCOMPRESSED").toUpperCase().trim();
+        if ("NONE".equals(compress)) {
             compress = "UNCOMPRESSED";
         }
-        CompressionCodecName compressionCodecName = CompressionCodecName.fromConf(compress);
-        LOG.info("The compression codec used for parquet writing is: {}", compressionCodecName, compress);
-        try {
-            proccessor = new ParquetFileProccessor(outputPath, messageType, compressionCodecName, false, taskConfig, taskPluginCollector, hadoopConf);
-        } catch (Exception e) {
-            String message = String.format("Initializing ParquetFileProccessor based on Schema[%s] failed.", schema);
-            LOG.error(message);
-            throw DataXException.asDataXException(HdfsWriterErrorCode.INIT_PROCCESSOR_FAILURE, e);
-        }
-        SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMddHHmm");
-        String attempt = "attempt_" + dateFormat.format(new Date()) + "_0001_m_000000_0";
-        conf.set(JobContext.TASK_ATTEMPT_ID, attempt);
-        FileOutputFormat outFormat = new TextOutputFormat();
-        outFormat.setOutputPath(conf, outputPath);
-        outFormat.setWorkOutputPath(conf, outputPath);
-        try {
-            Record record = null;
+        // construct parquet schema
+        Schema schema = generateParquetSchema(columns);
+
+        Path path = new Path(fileName);
+        LOG.info("write parquet file {}", fileName);
+        CompressionCodecName codecName = CompressionCodecName.fromConf(compress);
+
+        GenericData decimalSupport = new GenericData();
+        decimalSupport.addLogicalTypeConversion(new Conversions.DecimalConversion());
+
+
+
+        try (ParquetWriter<GenericRecord> writer = AvroParquetWriter
+                .<GenericRecord>builder(path)
+                .withRowGroupSize(ParquetWriter.DEFAULT_BLOCK_SIZE)
+                .withPageSize(ParquetWriter.DEFAULT_PAGE_SIZE)
+                .withSchema(schema)
+                .withConf(hadoopConf)
+                .withCompressionCodec(codecName)
+                .withValidation(false)
+                .withDictionaryEncoding(false)
+                .withDataModel(decimalSupport)
+                .withWriterVersion(ParquetProperties.WriterVersion.PARQUET_1_0)
+                .build()) {
+
+            Record record;
             while ((record = lineReceiver.getFromReader()) != null) {
-                proccessor.write(record);
+                GenericRecordBuilder builder = new GenericRecordBuilder(schema);
+                GenericRecord transportResult = transportParRecord(record, columns, taskPluginCollector, builder);
+                writer.write(transportResult);
             }
-        } catch (Exception e) {
-            String message = String.format("An exception occurred while writing the file file [%s]", fileName);
-            LOG.error(message);
-            Path path = new Path(fileName);
+        }
+        catch (Exception e) {
+            LOG.error("写文件文件[{}]时发生IO异常,请检查您的网络是否正常！", fileName);
             deleteDir(path.getParent());
             throw DataXException.asDataXException(HdfsWriterErrorCode.Write_FILE_IO_ERROR, e);
-        } finally {
-            if (proccessor != null) {
-                try {
-                    proccessor.close();
-                } catch (IOException e) {
-                    LOG.error(e.getMessage(), e);
+        }
+    }
+
+    private Schema generateParquetSchema(List<Configuration> columns)
+    {
+        List<Schema.Field> fields = new ArrayList<>();
+        String fieldName;
+        String type;
+        List<Schema> unionList = new ArrayList<>(2);
+        GenericData.Record defaultDecimalValue = null;
+        for (Configuration column : columns) {
+            unionList.clear();
+            fieldName = column.getString(Key.NAME);
+            type = column.getString(Key.TYPE).trim().toUpperCase();
+            unionList.add(Schema.create(Schema.Type.NULL));
+            switch (type) {
+                case "DECIMAL":
+                    Schema dec = LogicalTypes
+                            .decimal(column.getInt(Key.PRECISION, Constant.DEFAULT_DECIMAL_MAX_PRECISION),
+                                    column.getInt(Key.SCALE, Constant.DEFAULT_DECIMAL_MAX_SCALE))
+                            .addToSchema(Schema.createFixed(fieldName, null, null, 16));
+                    unionList.add(dec);
+
+                    break;
+                case "DATE":
+                    Schema date = LogicalTypes.date().addToSchema(Schema.create(Schema.Type.INT));
+                    unionList.add(date);
+                    break;
+                case "TIMESTAMP":
+                    Schema ts = LogicalTypes.timestampMillis().addToSchema(Schema.create(Schema.Type.LONG));
+                    unionList.add(ts);
+                    break;
+                case "UUID":
+                    Schema uuid = LogicalTypes.uuid().addToSchema(Schema.create(Schema.Type.STRING));
+                    unionList.add(uuid);
+                    break;
+                case "BINARY":
+                    unionList.add(Schema.create(Schema.Type.BYTES));
+                    break;
+                default:
+                    // other types
+                    unionList.add(Schema.create(Schema.Type.valueOf(type)));
+                    break;
+            }
+            fields.add(new Schema.Field(fieldName, Schema.createUnion(unionList), null, null));
+
+        }
+        Schema schema = Schema.createRecord("dataxTestParquet", null, "parquet", false);
+        schema.setFields(fields);
+        return schema;
+    }
+
+
+    public static GenericRecord transportParRecord(
+            Record record, List<Configuration> columnsConfiguration,
+            TaskPluginCollector taskPluginCollector, GenericRecordBuilder builder)
+    {
+
+        int recordLength = record.getColumnNumber();
+        if (0 != recordLength) {
+            Column column;
+            for (int i = 0; i < recordLength; i++) {
+                column = record.getColumn(i);
+                String colName = columnsConfiguration.get(i).getString(Key.NAME);
+                String typename = columnsConfiguration.get(i).getString(Key.TYPE).toUpperCase();
+                if (null == column || column.getRawData() == null) {
+                    builder.set(colName, null);
+                }
+                else {
+                    String rowData = column.getRawData().toString();
+                    SupportHiveDataType columnType = SupportHiveDataType.valueOf(typename);
+                    //根据writer端类型配置做类型转换
+                    try {
+                        switch (columnType) {
+                            case INT:
+                            case INTEGER:
+                                builder.set(colName, Integer.valueOf(rowData));
+                                break;
+                            case LONG:
+                                builder.set(colName, column.asLong());
+                                break;
+                            case FLOAT:
+                                builder.set(colName, Float.valueOf(rowData));
+                                break;
+                            case DOUBLE:
+                                builder.set(colName, column.asDouble());
+                                break;
+                            case STRING:
+                                builder.set(colName, column.asString());
+                                break;
+                            case DECIMAL:
+                                builder.set(colName, new BigDecimal(column.asString()).setScale(columnsConfiguration.get(i).getInt(Key.SCALE), BigDecimal.ROUND_HALF_UP));
+                                break;
+                            case BOOLEAN:
+                                builder.set(colName, column.asBoolean());
+                                break;
+                            case BINARY:
+                                builder.set(colName, column.asBytes());
+                                break;
+                            case TIMESTAMP:
+                                Long aLong = column.asLong();
+                                long l = 1000L;
+                                long l1 = column.asLong() / l;
+                                LOG.info("column.asLong(): {}, l1: {} ",aLong,l1);
+                                builder.set(colName, l1);
+                                break;
+                            default:
+                                throw DataXException
+                                        .asDataXException(
+                                                HdfsWriterErrorCode.ILLEGAL_VALUE,
+                                                String.format(
+                                                        "您的配置文件中的列配置信息有误. 不支持数据库写入这种字段类型. 字段名:[%s], 字段类型:[%s]. 请修改表中该字段的类型或者不同步该字段.",
+                                                        columnsConfiguration.get(i).getString(Key.NAME),
+                                                        columnsConfiguration.get(i).getString(Key.TYPE)));
+                        }
+                    }
+                    catch (Exception e) {
+                        // warn: 此处认为脏数据
+                        String message = String.format(
+                                "字段类型转换错误：目标字段为[%s]类型，实际字段值为[%s].",
+                                columnsConfiguration.get(i).getString(Key.TYPE), column.getRawData());
+                        taskPluginCollector.collectDirtyRecord(record, message);
+                        break;
+                    }
                 }
             }
         }
+        return builder.build();
     }
+
+
+    /**
+     * 获取parquet压缩格式
+     * @param compress
+     * @return
+     */
+    //private CompressionCodecName getParquetCompress(String compress) {
+    //    if (compress == null || compress.equalsIgnoreCase("NONE")) {
+    //        return CompressionCodecName.UNCOMPRESSED;
+    //    }
+    //
+    //    if("UNCOMPRESSED".equalsIgnoreCase(compress)){
+    //        return CompressionCodecName.UNCOMPRESSED;
+    //    }else if ("SNAPPY".equalsIgnoreCase(compress)){
+    //        return CompressionCodecName.SNAPPY;
+    //    }else if("GZIP".equalsIgnoreCase(compress)){
+    //        return CompressionCodecName.GZIP;
+    //    }else if("LZO".equalsIgnoreCase(compress)){
+    //        return CompressionCodecName.LZO;
+    //    }else if ("BROTLI".equalsIgnoreCase(compress)){
+    //        return CompressionCodecName.BROTLI;
+    //    }else if ("LZ4".equalsIgnoreCase(compress)){
+    //        return CompressionCodecName.LZ4;
+    //    }else if ("ZSTD".equalsIgnoreCase(compress)){
+    //        return CompressionCodecName.ZSTD;
+    //    }else {
+    //        throw DataXException.asDataXException(HdfsWriterErrorCode.ILLEGAL_VALUE
+    //                ,String.format("目前不支持您配置的 compress 模式 : [%s]", compress));
+    //    }
+    //}
+
+    /**
+     * 拼接用于实例化schema的字符串
+     * @param config
+     * @return
+     */
+//    private String getSchemaStr(Configuration config) {
+////        拼接字符串样例
+////        String str1 = "{" +
+////                " \"type\": \"record\"," +
+////                " \"name\": \"empRecords\"," +
+////                " \"doc\": \"Employee Records\"," +
+////                " \"fields\": " +
+////                "  [{" +
+////                "   \"name\": \"id\", " +
+////                "   \"type\": \"int\"" +
+////                "   " +
+////                "  }, " +
+////                "  {" +
+////                "   \"name\": \"name\"," +
+////                "   \"type\": \"string\"" +
+////                "  }]" +
+////                "}";
+//        String str =  "{" +
+//                " \"type\": \"record\"," +
+//                " \"name\": \"parquetFile\"," +
+//                " \"doc\": \"parquet Records\"," +
+//                " \"fields\": [";
+//        List<Configuration> columns = config.getListConfiguration(Key.COLUMN);
+//        for (int i = 0; i < columns.size(); i++) {
+//            if (i < columns.size()-1) {
+//                // 只要不是最后一个都要拼接一个逗号
+//                str = str + columns.get(i) + ",";
+//            }else {
+//                str = str + columns.get(i);
+//            }
+//        }
+//        str = str + "]" + "}";
+//        return str;
+//    }
+
+    /**
+     * 获取schema
+     * @param str
+     * @return
+     */
+    //private Schema parseSchema(String str) {
+    //    Schema.Parser parser = new Schema.Parser();
+    //    Schema parse = parser.parse(str);
+    //    return parse;
+    //}
 
 }

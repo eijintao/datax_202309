@@ -47,6 +47,12 @@ public class Key {
     public static final String PARQUET_SCHEMA = "parquetSchema";
     public static final String PARQUET_MERGE_RESULT = "parquetMergeResult";
 
+    public static final String PRECISION = "precision";
+    public static final String SCALE = "scale";
+
+
+
+
     /**
      * hive 3.x 或 cdh高版本，使用UTC时区存储时间戳，如果发现时区偏移，该配置项要配置成 true
      */
